@@ -1,0 +1,286 @@
+#!/bin/bash
+# ver.: 2306
+# by vvn 
+# 2023.03
+# This script works for ubuntu 21.04 or later. you must know what you are doing when run this script.  
+# if the linux kenel path is like linux-x.x, you must change the derectory to linux-x.x.x at first, 
+# the ARG_KERNEL_WITH_VERSION_DIR must be linux-x.x.x, such as linux-5.15.0.
+#
+# if you don't use the defconfig with this, find config-xxx in /boot/ directory.
+#
+# Linux kernel download: https://www.kernel.org
+# ubuntu release: https://kernel.ubuntu.com/~kernel-ppa/mainline
+
+# Reqired modules (may be more):
+# sudo apt install libncurses-dev
+# sudo apt install libssl-dev
+# sudo apt install libelf-dev
+# sudo apt install dwarves
+#
+# Build directory: (vxxx -> xxx is builder version)
+#   xps9310-intel-x86_64-kernel-build-vxxx
+#   xps9310-intel-x86_64-kernel-x.y-vxxx_defconfig
+#   linux-x.y.z (directory, kernel src)
+#   patch-x.y (directory, kernel inc patch)
+#
+# Note:
+# 1. intel firmware version: drivers/net/wireless/intel/iwlwifi/cfg/22000.c : IWL_22000_UCODE_API_MAX 74 //(kernel 6.1 , 66 for kernel 5.15).
+# 2. set CONFIG_FRAME_WARN=1280 in defconfig, to solve the buffer limitation warning.
+# 3. touchscreen need wacom8001, and i2c-designware.
+# 4. ubuntu normal startup without initrd.img-x.x.x (standalone mode), configures nvme/mtd changed from [M] to [*], compiled & linked into kenel image.
+# 5. for kernel 6.x, from 6.1.15 defconfig, ubuntu recorvery mode can start up.
+
+# =========good lucky==================
+
+ARG_BUILDER=$0
+ARG_KERNEL_WITH_VERSION_DIR=$1
+ARG_CMD=$2
+ARG_PARAM=$3
+
+BUILDER_VER=${ARG_BUILDER##*-}
+CURRENT_PATH=$(pwd)
+
+KERNEL_VER_STR=${ARG_KERNEL_WITH_VERSION_DIR##*-}
+KERNEL_SRC_PATH=${CURRENT_PATH}/linux-${KERNEL_VER_STR}
+PATCH_DOWNLOAD_PATH="/home/vvn/Downloads/kernel-inc-patchs"
+PATCH_FILES_PATH="patch-${KERNEL_VER_STR%.*}"
+# echo "${PATCH_FILES_PATH} --> patch path"
+
+DEFCONFIG=xps9310-intel-x86_64-kernel-${KERNEL_VER_STR%.*}-${BUILDER_VER}_defconfig
+DEFCONFIG_INITRAMFS=xps9310-intel-x86_64-kernel-${KERNEL_VER_STR%.*}-initramfs-${BUILDER_VER}_defconfig
+DEFCONFIG_STANDALONE=xps9310-intel-x86_64-kernel-${KERNEL_VER_STR%.*}-standalone-${BUILDER_VER}_defconfig
+
+show_usage(){
+    echo "The first argument must be a linux kernel listed in this folder, and cmd must be correct:"
+    echo ""
+    ls ./
+    echo ""
+    echo "usage 1 ( general compiling ): ${ARG_BUILDER} linux-x.xx.xx"
+    echo "usage 2 ( cmd operating ): ${ARG_BUILDER} linux-x.xx.xx cmd"
+    echo "usage 3 ( patch ): ${ARG_BUILDER} linux-x.xx.xx [patch-x.xx/patch-x.xx.xx-xx][patch-x.xx.xx-xx]"
+    echo "    cmd: config [initramfs], clean, uninstall, install [headers][ initrd ], remove, initramfs."
+    echo ""
+    echo "Good lucky....[way.hu@iseeway.com]"
+    echo ""
+}
+
+if [ ! -d ${KERNEL_SRC_PATH} ]; then
+    if [ ${#ARG_CMD} -lt 1 ] || [ "${ARG_CMD}" != "uninstall" ]; then
+        show_usage
+        exit 1
+    fi
+else
+    # read version from Makefile.
+    make_ver=$(sed -n '2p' ${KERNEL_SRC_PATH}/Makefile)
+    make_patch=$(sed -n '3p' ${KERNEL_SRC_PATH}/Makefile)
+    make_sub=$(sed -n '4p' ${KERNEL_SRC_PATH}/Makefile)
+    # sed removes all spaces
+    current_release_ver=$(echo ${make_ver##*=}.${make_patch##*=}.${make_sub##*=} | sed 's/ //g') 
+fi
+
+if [ ${#ARG_CMD} -gt 0 ]; then  
+    # decompress a downloaded inc-patch file.
+    if [ "${ARG_CMD%-*}" == "patch-${KERNEL_VER_STR}" ] || [ "${ARG_CMD%-*}" == "${PATCH_DOWNLOAD_PATH}/patch-${KERNEL_VER_STR}" ]; then
+        if [ ! -s ${ARG_CMD} ]; then
+            ARG_CMD=${PATCH_DOWNLOAD_PATH}/${ARG_CMD}.xz
+        fi
+        
+        if [ -s ${ARG_CMD} ] && [ -d ${PATCH_FILES_PATH} ]; then               
+           if xz -kdf ${ARG_CMD}; then
+                PATCH_FILE=${ARG_CMD%.*}
+                if [ -s ${PATCH_FILE} ]; then
+                    mv ${PATCH_FILE} ${PATCH_FILES_PATH}/
+                    
+                    echo "--- ${ARG_CMD} decompressed succussfully-------"
+                    if [ "${current_release_ver}" == "${KERNEL_VER_STR}" ]; then                                             
+                        ARG_CMD=${PATCH_FILES_PATH}/${PATCH_FILE##*/}
+                    else
+                        echo "---kernel version is not matched!-----"
+                        exit 1
+                    fi
+                fi
+           fi           
+        fi
+    fi
+    
+    if [ "${ARG_CMD%-*}" == "${PATCH_FILES_PATH}/patch-${KERNEL_VER_STR}" ]; then
+        echo "=== ${ARG_CMD}: patching ${ARG_KERNEL_WITH_VERSION_DIR} ==="
+        
+        PATCH_FILE=${ARG_CMD}
+                    
+        if [ -s ${CURRENT_PATH}/${PATCH_FILE} ] && [ "${current_release_ver}" == "${KERNEL_VER_STR}" ]; then
+            # patch file like: patch-5.15/patch-5.15.26-27
+            pre_ver=${PATCH_FILE#*/} #patch-5.15.26-27
+            pre_ver=${pre_ver%-*}    #patch-5.15.26
+            pre_ver=${pre_ver#*-}    #5.15.26
+            echo "--------- ${pre_ver}--------"
+            if [ "${pre_ver}" == "${KERNEL_VER_STR}" ]; then
+                # create a new kernel version according to the last number of patch file name.
+                # like ${pre_ver%.*} = 5.15, ${PATCH_FILE##*-} = 27
+                new_kernel_ver_str=${pre_ver%.*}.${PATCH_FILE##*-}
+                
+                NEW_KERNEL_SRC_PATH=${CURRENT_PATH}/linux-${new_kernel_ver_str}
+                if [ ! -d ${NEW_KERNEL_SRC_PATH} ]; then
+                    mv ${CURRENT_PATH}/linux-${pre_ver} ${NEW_KERNEL_SRC_PATH}
+                    
+                    echo "Patching ${PATCH_FILE} into ${NEW_KERNEL_SRC_PATH} ..."
+                    echo ""
+                    if patch -p1 -d ${NEW_KERNEL_SRC_PATH} < ${PATCH_FILE}; then
+                        echo ""
+                        echo "Patching ... OK"
+                    fi
+
+                fi
+            fi
+        else
+            echo "The patch file or '${PATCH_FILE}' parameter is not exsit!!"
+            show_usage
+        fi
+    elif [ "${ARG_CMD}" == "clean" ]; then
+        echo "=== ${ARG_CMD}: ${ARG_KERNEL_WITH_VERSION_DIR} ==="
+        sudo make -C ${KERNEL_SRC_PATH} distclean
+        if [ -s ${KERNEL_SRC_PATH}/arch/x86/configs/${DEFCONFIG} ]; then
+            rm -f ${KERNEL_SRC_PATH}/arch/x86/configs/${DEFCONFIG}
+        fi
+    elif [ "${ARG_CMD}" == "uninstall" ]; then
+        echo "=== ${ARG_CMD}: ${ARG_KERNEL_WITH_VERSION_DIR} ==="
+        
+        if [ -d /lib/modules/${KERNEL_VER_STR} ]; then
+            sudo rm -rf /lib/modules/${KERNEL_VER_STR}
+        fi
+        if [ -s /boot/initrd.img-${KERNEL_VER_STR} ]; then
+            sudo rm /boot/initrd.img-${KERNEL_VER_STR}
+        fi
+        if [ -s /boot/vmlinuz-${KERNEL_VER_STR} ]; then
+            sudo rm /boot/vmlinuz-${KERNEL_VER_STR}
+            
+            sudo update-grub
+        fi
+        
+    elif [ "${ARG_CMD}" == "install" ]; then
+        if [ ${#ARG_PARAM} -gt 0 ] && [ "${ARG_PARAM}" == "initrd" ]; then
+            if [ -s /boot/vmlinuz-${KERNEL_VER_STR} ]; then
+                sudo rm /boot/vmlinuz-${KERNEL_VER_STR}
+            fi  
+        
+            if [ -d /lib/modules/${KERNEL_VER_STR} ]; then
+                sudo rm -rf /lib/modules/${KERNEL_VER_STR}
+            fi
+            sudo make -C ${KERNEL_SRC_PATH} INSTALL_MOD_STRIP=1 modules_install
+            
+            if [ -s /boot/initrd.img-${KERNEL_VER_STR} ]; then
+                sudo rm /boot/initrd.img-${KERNEL_VER_STR}
+            fi
+            sudo mkinitramfs /lib/modules/${KERNEL_VER_STR} -c zstd -o /boot/initrd.img-${KERNEL_VER_STR}
+            
+            # boot linux kernel without initrd, so can disable makeinitramfs.
+            if [ -s ${KERNEL_SRC_PATH}/arch/x86/boot/bzImage ]; then                
+                sudo cp -f ${KERNEL_SRC_PATH}/arch/x86/boot/bzImage  /boot/vmlinuz-${KERNEL_VER_STR}                            
+                sudo update-grub
+                
+                echo "-----install succussfully------"
+            else
+                echo "${ARG_KERNEL_WITH_VERSION_DIR}/arch/x86/boot/bzImage not found!"
+            fi
+        elif [ ${#ARG_PARAM} -gt 0 ] && [ "${ARG_PARAM}" == "headers" ]; then
+            sudo make -C ${KERNEL_SRC_PATH} headers_install
+        fi
+    elif [ "${ARG_CMD}" == "remove" ]; then
+        echo "=== ${ARG_CMD}: ${ARG_KERNEL_WITH_VERSION_DIR} ==="
+
+        sudo rm -rf ${KERNEL_SRC_PATH}
+    elif [ "${ARG_CMD}" == "config" ]; then
+        if [ ${#ARG_PARAM} -gt 0 ] && [ "${ARG_PARAM}" == "initramfs" ]; then
+            DEFCONFIG=${DEFCONFIG_INITRAMFS}
+        elif [ ${#ARG_PARAM} -gt 0 ] && [ "${ARG_PARAM}" == "standalone" ]; then
+            DEFCONFIG=${DEFCONFIG_STANDALONE}
+        fi
+        
+        echo "=== ${ARG_CMD}: ${ARG_KERNEL_WITH_VERSION_DIR} with ${DEFCONFIG} ==="
+        if [ -s ${CURRENT_PATH}/${DEFCONFIG} ]; then
+            cp -f ${CURRENT_PATH}/${DEFCONFIG} ${KERNEL_SRC_PATH}/arch/x86/configs/${DEFCONFIG}
+        fi
+
+        if [ -s ${KERNEL_SRC_PATH}/arch/x86/configs/${DEFCONFIG} ]; then     
+            make -C ${KERNEL_SRC_PATH} ARCH=x86_64 ${DEFCONFIG}
+            make -C ${KERNEL_SRC_PATH} ARCH=x86_64 menuconfig
+            cp -f ${KERNEL_SRC_PATH}/.config ${CURRENT_PATH}/${DEFCONFIG}
+        fi            
+    elif [ "${ARG_CMD}" == "initramfs" ]; then
+        # initramfs compiling & installing ...
+        INITRAMFS_DEST_PATH=/home/vvn/initrd.img/main
+        
+        echo "====== build: ${ARG_KERNEL_WITH_VERSION_DIR} with ${DEFCONFIG_INITRAMFS} ======"
+        if [ -s ${CURRENT_PATH}/${DEFCONFIG_INITRAMFS} ]; then
+            cp -f ${CURRENT_PATH}/${DEFCONFIG_INITRAMFS} ${KERNEL_SRC_PATH}/arch/x86/configs/${DEFCONFIG_INITRAMFS}
+        fi
+        
+        if [ -s ${KERNEL_SRC_PATH}/arch/x86/configs/${DEFCONFIG_INITRAMFS} ]; then
+            make -C ${KERNEL_SRC_PATH} ARCH=x86_64 ${DEFCONFIG_INITRAMFS}
+                   
+            make -j 8 -C ${KERNEL_SRC_PATH} ARCH=x86_64 modules
+            
+	        sudo rm -rf ${INITRAMFS_DEST_PATH}/lib/modules/*
+	        sudo install -d ${INITRAMFS_DEST_PATH}/lib/modules
+	        
+	        sudo make -C ${KERNEL_SRC_PATH} INSTALL_MOD_PATH=${INITRAMFS_DEST_PATH} INSTALL_MOD_STRIP=1 modules_install
+	      
+            make -j 8 -C ${KERNEL_SRC_PATH} ARCH=x86_64 bzImage
+            
+            if [ -s ${KERNEL_SRC_PATH}/arch/x86/boot/bzImage ]; then
+	            sudo install ${KERNEL_SRC_PATH}/arch/x86/boot/bzImage /boot/initramfs-vmlinuz-${KERNEL_VER_STR}
+	        fi
+	    else
+            echo "${DEFCONFIG} not found."
+            show_usage
+	    fi
+	elif [ "${ARG_CMD}" == "standalone" ]; then
+        # standalone compiling & installing ...
+                
+        echo "====== build: ${ARG_KERNEL_WITH_VERSION_DIR} with ${DEFCONFIG_STANDALONE} ======"
+        if [ -s ${CURRENT_PATH}/${DEFCONFIG_STANDALONE} ]; then
+            cp -f ${CURRENT_PATH}/${DEFCONFIG_STANDALONE} ${KERNEL_SRC_PATH}/arch/x86/configs/${DEFCONFIG_STANDALONE}
+        fi
+        
+        if [ -s ${KERNEL_SRC_PATH}/arch/x86/configs/${DEFCONFIG_STANDALONE} ]; then
+            make -C ${KERNEL_SRC_PATH} ARCH=x86_64 ${DEFCONFIG_STANDALONE}
+                   
+            make -j 8 -C ${KERNEL_SRC_PATH} ARCH=x86_64 bzImage
+            make -j 8 -C ${KERNEL_SRC_PATH} ARCH=x86_64 modules            	      
+            
+            if [ -d /lib/modules/${KERNEL_VER_STR} ]; then
+                sudo rm -rf /lib/modules/${KERNEL_VER_STR}
+            fi
+            
+            sudo make -C ${KERNEL_SRC_PATH} INSTALL_MOD_STRIP=1 modules_install
+                    
+            if [ -s ${KERNEL_SRC_PATH}/arch/x86/boot/bzImage ]; then
+	            sudo install ${KERNEL_SRC_PATH}/arch/x86/boot/bzImage /boot/standalone-vmlinuz-${KERNEL_VER_STR}
+	        fi
+	    else
+            echo "${DEFCONFIG} not found."
+            show_usage
+	    fi
+	else
+        show_usage
+	fi
+else
+    # normal compiling ... 
+    if [ -s ${CURRENT_PATH}/${DEFCONFIG} ]; then
+        cp -f ${CURRENT_PATH}/${DEFCONFIG} ${KERNEL_SRC_PATH}/arch/x86/configs/${DEFCONFIG}
+    fi
+
+    if [ -s ${KERNEL_SRC_PATH}/arch/x86/configs/${DEFCONFIG} ]; then
+        make -C ${KERNEL_SRC_PATH} ARCH=x86_64 ${DEFCONFIG}
+        echo "=== build: ${ARG_KERNEL_WITH_VERSION_DIR} with ${DEFCONFIG} ==="
+        
+        make -j 8 -C ${KERNEL_SRC_PATH} ARCH=x86_64 bzImage
+        make -j 8 -C ${KERNEL_SRC_PATH} ARCH=x86_64 modules
+    else
+        echo "${DEFCONFIG} not found."
+        show_usage
+    fi
+fi
+    
+#=========== the end ==============
+
